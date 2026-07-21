@@ -1,0 +1,27 @@
+{
+  "name": "ecommerce-ch-sink",
+  "config": {
+    "connector.class": "com.clickhouse.kafka.connect.ClickHouseSinkConnector",
+    "tasks.max": "1",
+    "topics": "ecommerce.public.categories,ecommerce.public.customers,ecommerce.public.products,ecommerce.public.orders,ecommerce.public.order_items,ecommerce.public.payments",
+
+    "hostname": "dbz-clickhouse",
+    "port": "8123",
+    "ssl": "false",
+    "database": "debezium_cdc",
+    "username": "clickhouse_etl",
+    "password": "clickhouse_etl_password",
+
+    "topic2TableMap": "ecommerce.public.categories=categories,ecommerce.public.customers=customers,ecommerce.public.products=products,ecommerce.public.orders=orders,ecommerce.public.order_items=order_items,ecommerce.public.payments=payments",
+
+    "debeziumCDCEnabled": "true",
+    "errors.tolerance": "none",
+    "exactlyOnce": "false",
+    "auto.evolve": "false",
+
+    "key.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "key.converter.schemas.enable": "false",
+    "value.converter": "org.apache.kafka.connect.json.JsonConverter",
+    "value.converter.schemas.enable": "true"
+  }
+}

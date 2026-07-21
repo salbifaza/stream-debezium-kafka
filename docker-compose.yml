@@ -1,0 +1,175 @@
+name: debezium-cdc-poc
+
+# Container names below are all `dbz-`-prefixed and every host port is
+# chosen to avoid the ones stream-cdc-peerdb's stack uses (5432, 8123, 9000,
+# 9001, 9002, 3001, 7233, 8085, 8112, 8113, 9900, 9901) -- both stacks can
+# run at the same time for a direct side-by-side comparison.
+
+services:
+  # ---------------------------------------------------------------------
+  # Kafka broker: apache/kafka in KRaft mode (combined broker+controller,
+  # single node). No ZooKeeper -- current modern practice; a lot of older
+  # Debezium tutorials still show it, but Kafka itself has moved on.
+  # ---------------------------------------------------------------------
+  kafka:
+    container_name: dbz-kafka
+    image: apache/kafka:4.3.1
+    restart: unless-stopped
+    ports:
+      - "9094:9094" # EXTERNAL listener, for host tools (kafka-console-consumer, etc.)
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # Three listeners: PLAINTEXT for container-to-container traffic
+      # (advertised as the compose DNS name), EXTERNAL for host access
+      # (advertised as localhost:9094), CONTROLLER for KRaft's own quorum
+      # traffic (never advertised, controller-only).
+      KAFKA_LISTENERS: PLAINTEXT://:9092,EXTERNAL://:9094,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://dbz-kafka:9092,EXTERNAL://localhost:9094
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@dbz-kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # ---------------------------------------------------------------------
+  # Source and destination -- the actual CDC pipeline endpoints, same
+  # e-commerce schema/data as stream-cdc-peerdb.
+  # ---------------------------------------------------------------------
+  source-postgres:
+    container_name: dbz-source-postgres
+    image: postgres:16.14-alpine
+    restart: unless-stopped
+    command: >
+      postgres
+      -c wal_level=logical
+      -c max_wal_senders=10
+      -c max_replication_slots=10
+      -c max_connections=100
+    environment:
+      POSTGRES_USER: ${SOURCE_PG_USER:-ecommerce}
+      POSTGRES_PASSWORD: ${SOURCE_PG_PASSWORD:-ecommerce}
+      POSTGRES_DB: ${SOURCE_PG_DB:-ecommerce}
+    ports:
+      - "5433:5432"
+    volumes:
+      - source_pgdata:/var/lib/postgresql/data
+      - ./postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_PG_USER:-ecommerce} -d ${SOURCE_PG_DB:-ecommerce}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  clickhouse:
+    container_name: dbz-clickhouse
+    image: clickhouse/clickhouse-server:25.8.24-alpine
+    restart: unless-stopped
+    environment:
+      # Bootstrap/admin identity only -- used to provision the scoped
+      # clickhouse_etl user below via clickhouse/init/01_clickhouse_etl_user.sh.
+      # Nothing else should ever authenticate as this user.
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-ch_admin}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-ch_admin_password}
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+      CLICKHOUSE_DB: debezium_cdc
+      # The least-privilege user the ClickHouse sink connector actually
+      # connects as (see connectors/ch-sink-connector.json).
+      CLICKHOUSE_ETL_USER: ${CLICKHOUSE_ETL_USER:-clickhouse_etl}
+      CLICKHOUSE_ETL_PASSWORD: ${CLICKHOUSE_ETL_PASSWORD:-clickhouse_etl_password}
+    ports:
+      - "8124:8123" # HTTP interface (clickhouse-client --port 8124, curl, BI tools)
+      - "9010:9000" # native protocol
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------
+  # Kafka Connect: custom image (kafka-connect/Dockerfile) = Debezium's
+  # own connect image (ships the Postgres source connector) + the
+  # official ClickHouse Kafka Connect sink connector added as a second
+  # plugin. This build step -- and the fact that it's a build step at all
+  # -- is itself the concrete version of "four extra systems to assemble"
+  # from stream-cdc-peerdb's README.
+  # ---------------------------------------------------------------------
+  kafka-connect:
+    container_name: dbz-kafka-connect
+    build:
+      context: ./kafka-connect
+    restart: unless-stopped
+    depends_on:
+      kafka:
+        condition: service_healthy
+      source-postgres:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    ports:
+      - "8087:8083" # Kafka Connect REST API (register/inspect connectors)
+    environment:
+      BOOTSTRAP_SERVERS: dbz-kafka:9092
+      GROUP_ID: ecommerce-connect-cluster
+      CONFIG_STORAGE_TOPIC: _connect-configs
+      OFFSET_STORAGE_TOPIC: _connect-offsets
+      STATUS_STORAGE_TOPIC: _connect-status
+      ADVERTISED_HOST_NAME: dbz-kafka-connect
+      # Single-node cluster -- Connect's internal config/offset/status
+      # topics default to replication factor 3, which a 1-broker cluster
+      # can never satisfy.
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8083/connectors >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 30s
+
+  # One dashboard for topics, consumer lag, and connector/task status --
+  # the role temporal-ui + peerdb-ui jointly play in stream-cdc-peerdb.
+  kafka-ui:
+    container_name: dbz-kafka-ui
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    ports:
+      - "8086:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: ecommerce
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: dbz-kafka:9092
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_NAME: connect
+      KAFKA_CLUSTERS_0_KAFKACONNECT_0_ADDRESS: http://dbz-kafka-connect:8083
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+volumes:
+  kafka_data:
+  source_pgdata:
+  clickhouse_data:
+
+networks:
+  default:
+    name: debezium_network
