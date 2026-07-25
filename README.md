@@ -31,8 +31,8 @@ comparison is evidence, not assertion, on both sides. Same three pillars:
 **If you have two minutes:** read this section, then
 [Why Debezium + Kafka Connect](#why-debezium--kafka-connect-and-not-peerdb)
 and [What this actually proves](#what-this-actually-proves).
-**If you're doing technical diligence:** `Quickstart` below reproduces the
-whole thing in one command; every technical claim links to the exact
+**If you're doing technical diligence:** `make up && make verify`
+reproduces the whole thing; every technical claim links to the exact
 script or doc section that proves it.
 
 ### Competencies this demonstrates
@@ -154,24 +154,67 @@ caught it:
 ## Quickstart
 
 ```bash
-cp .env.example .env
-docker compose up -d --build
-./scripts/register_connectors.sh
-./scripts/verify_cdc.sh
+make up       # starts everything + registers connectors automatically
+make verify   # row-count check + live insert/update/delete test
 ```
 
-First run pulls Kafka, Kafka Connect's base image, ClickHouse, and Postgres,
-and builds the custom `kafka-connect` image (downloads the ClickHouse sink
-connector plugin) — expect a few minutes depending on your connection.
+That's it. `make up` starts the full stack (Kafka, Kafka Connect,
+Postgres, ClickHouse, kafka-ui), waits for Kafka Connect to become
+healthy, and registers both connectors. `make verify` runs the end-to-end
+CDC verification.
 
-Check that the stack is healthy:
+First run pulls Kafka, Kafka Connect's base image, ClickHouse, and
+Postgres, and builds the custom `kafka-connect` image (downloads the
+ClickHouse sink connector plugin) — expect a few minutes depending on
+your connection.
+
+Other useful targets:
 
 ```bash
-docker compose ps
+make status   # connector/task status, consumer lag, WAL retention, row counts
+make logs     # tail all service logs
+make down     # stop, keep data volumes
+make reset    # stop and wipe all state (full rebuild on next make up)
 ```
 
-You should see `dbz-kafka`, `dbz-source-postgres`, `dbz-clickhouse`,
-`dbz-kafka-connect`, and `dbz-kafka-ui` all `Up (healthy)`.
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph Source["Source: OLTP"]
+        PG[(Postgres 16<br/>ecommerce db)]
+        WAL[[WAL<br/>wal_level=logical]]
+        SLOT{{Replication slot<br/>debezium_slot}}
+        PG -- writes --> WAL
+        WAL -- logical decoding<br/>pgoutput --> SLOT
+    end
+
+    subgraph Connect["Kafka Connect (custom image)"]
+        SRC[Debezium Postgres<br/>source connector]
+        SINK[ClickHouse sink connector<br/>debeziumCDCEnabled=true]
+    end
+
+    subgraph Broker["Kafka (KRaft, single node)"]
+        TOPICS[[per-table topics<br/>ecommerce.public.*]]
+    end
+
+    subgraph Dest["Destination: OLAP"]
+        CH[(ClickHouse<br/>debezium_cdc db)]
+    end
+
+    SLOT -- streamed changes --> SRC
+    SRC -- envelope JSON<br/>op/before/after/source --> TOPICS
+    TOPICS -- consume --> SINK
+    SINK -- INSERT<br/>+ _version/is_deleted --> CH
+
+    UI[kafka-ui :8086] -.observes.-> Broker
+    UI -.observes.-> Connect
+```
+
+See [`docs/architecture.md`](docs/architecture.md) for the full mechanics,
+failure-mode findings, and every design decision in detail.
+
+---
 
 ## What's running, and why it's shaped this way
 
@@ -370,8 +413,8 @@ for the full comparison against `MergeTree`/`CollapsingMergeTree`/
 ## Tearing down
 
 ```bash
-docker compose down          # stop, keep data volumes
-docker compose down -v       # stop and wipe all data (start fresh)
+make down      # stop, keep data volumes
+make reset     # stop and wipe all data (start fresh on next make up)
 ```
 
 ## Repo layout
@@ -379,25 +422,34 @@ docker compose down -v       # stop and wipe all data (start fresh)
 ```
 docker-compose.yml            # full stack: Kafka (KRaft) + Kafka Connect (custom image)
                                # + kafka-ui + source Postgres + ClickHouse
-.env.example                  # copy to .env
+Makefile                      # all commands: up, verify, status, reset
+.env.example                  # copy to .env; override credentials here
+LICENSE                       # MIT
+
 kafka-connect/
   Dockerfile                  # Debezium's Connect image + ClickHouse sink connector plugin
+
 postgres/
   init/00_pg-hba-replication.sh # allows replication connections from Kafka Connect
   init/01_schema.sql            # e-commerce schema + publication (same data as stream-cdc-peerdb)
   init/02_seed.sql              # identical seed data to stream-cdc-peerdb
+
 clickhouse/
   init/01_clickhouse_etl_user.sh # provisions the least-privilege clickhouse_etl user
   init/02_destination_tables.sql # hand-written ReplacingMergeTree DDL, one per table
+
 connectors/
   pg-source-connector.json      # Debezium Postgres source connector config
   ch-sink-connector.json        # ClickHouse sink connector config (debeziumCDCEnabled)
+
 scripts/
-  register_connectors.sh        # applies both connector configs via Connect's REST API
+  register_connectors.sh        # applies connector configs via Connect's REST API
+                                 # (injects credentials from .env at registration time)
   verify_cdc.sh                 # row-count check + live insert/update/delete test
   connector_status.sh           # monitoring: connector/task status, consumer lag,
                                  # replication slot size, ClickHouse row counts
+
 docs/
-  architecture.md                # CDC mechanics, diagram, engine rationale,
-                                  # failure-mode evidence, comparison notes vs. stream-cdc-peerdb
+  architecture.md               # CDC mechanics, diagram, engine rationale,
+                                 # failure-mode evidence, comparison notes vs. stream-cdc-peerdb
 ```

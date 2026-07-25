@@ -1,0 +1,33 @@
+name: Smoke Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Start stack
+        run: |
+          cp .env.example .env
+          docker compose up -d --build
+
+      - name: Register connectors
+        run: ./scripts/register_connectors.sh
+
+      - name: Verify CDC pipeline
+        run: ./scripts/verify_cdc.sh
+
+      - name: Show logs on failure
+        if: failure()
+        run: docker compose logs --tail=50
+
+      - name: Teardown
+        if: always()
+        run: docker compose down -v
