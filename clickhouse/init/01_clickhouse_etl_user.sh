@@ -5,18 +5,19 @@
 # bootstrap/admin identity used only to run this script -- nothing else
 # should authenticate as it.
 #
-# Unlike PeerDB's ClickHouse peer, this connector never runs CREATE TABLE or
-# ALTER TABLE -- destination tables are pre-created by hand in
-# 02_destination_tables.sql and schema drift is NOT propagated
-# automatically (see docs/architecture.md). So the grant set here is
-# deliberately narrower than PeerDB's: just INSERT/SELECT, scoped to the
-# debezium_cdc database. Adjusted if empirical testing (Stage 3/4) surfaces
-# a real requirement beyond this.
+# Unlike PeerDB's ClickHouse peer, this connector never runs CREATE TABLE --
+# destination tables are pre-created by hand in 02_destination_tables.sql.
+# It does run ALTER TABLE ... ADD COLUMN, because the sink runs with
+# `auto.evolve=true` (connectors/ch-sink-connector.json): a column added on
+# the source is added in ClickHouse automatically. Without this grant the
+# task fails with ACCESS_DENIED on the first new column (tested -- see
+# docs/architecture.md). Still narrower than PeerDB's grant set: add-column
+# only (no drop/modify/rename), scoped to the debezium_cdc database.
 set -e
 
 CH=(clickhouse-client -u "${CLICKHOUSE_USER}" --password "${CLICKHOUSE_PASSWORD}")
 
 "${CH[@]}" -q "CREATE USER IF NOT EXISTS ${CLICKHOUSE_ETL_USER} IDENTIFIED WITH sha256_password BY '${CLICKHOUSE_ETL_PASSWORD}'"
-"${CH[@]}" -q "GRANT INSERT, SELECT ON ${CLICKHOUSE_DB}.* TO ${CLICKHOUSE_ETL_USER}"
+"${CH[@]}" -q "GRANT INSERT, SELECT, ALTER ADD COLUMN ON ${CLICKHOUSE_DB}.* TO ${CLICKHOUSE_ETL_USER}"
 
 echo "$0: clickhouse_etl user provisioned with least-privilege grants"

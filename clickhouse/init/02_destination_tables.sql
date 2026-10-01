@@ -1,11 +1,11 @@
 -- Hand-written destination DDL -- the single clearest concrete contrast
 -- with PeerDB, which auto-generates this from the source table on
 -- `CREATE MIRROR`. Here, the ClickHouse Kafka Connect sink connector does
--- NOT create tables, and (with `auto.evolve=false`, this pipeline's
--- default) does not alter them either -- these must exist before the
--- connector starts, and the operator owns keeping them in sync with the
--- source schema (see docs/architecture.md's schema-evolution findings,
--- including what happens with `auto.evolve=true` instead).
+-- NOT create tables -- these must exist before the connector starts. With
+-- `auto.evolve=true` (connectors/ch-sink-connector.json) it does add
+-- columns that appear on the source later, but only adds: a renamed or
+-- dropped source column is still the operator's job (see
+-- docs/architecture.md's schema-evolution findings).
 --
 -- Column shape: verified against the connector's own source
 -- (DebeziumRecordConvertor.java) rather than assumed. With

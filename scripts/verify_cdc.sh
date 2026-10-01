@@ -67,9 +67,42 @@ if [ "$insert_ok" -ne 1 ] || [ "$update_ok" -ne 1 ] || [ "$delete_ok" -ne 1 ]; t
 fi
 
 echo
-echo "== Step 3: gold layer (Flink) matches the same aggregates computed in Postgres =="
+echo "== Step 3: schema evolution (auto.evolve) -- a new source column reaches ClickHouse =="
+# IF NOT EXISTS keeps this re-runnable: on the first run it's a real schema
+# change; later runs just write a new value through the existing column.
+weight=$(( $(date +%s) % 100000 ))
+echo "  ALTER TABLE products ADD COLUMN IF NOT EXISTS weight_grams INTEGER; setting product_id=1 to ${weight}..."
+$PG_EXEC -c "SET client_min_messages = warning; ALTER TABLE products ADD COLUMN IF NOT EXISTS weight_grams INTEGER;" >/dev/null
+$PG_EXEC -c "UPDATE products SET weight_grams = ${weight}, updated_at = now() WHERE product_id = 1;" >/dev/null
+
+echo "  polling ClickHouse for the new column and value (up to 60s)..."
+deadline=$((SECONDS + 60))
+evolve_ok=0
+while [ $SECONDS -lt $deadline ]; do
+    # Errors until the sink has run ALTER TABLE ... ADD COLUMN.
+    ch_val=$($CH_EXEC -q "SELECT weight_grams FROM debezium_cdc.products FINAL WHERE product_id = 1;" 2>/dev/null || true)
+    if [ "$ch_val" = "$weight" ]; then
+        evolve_ok=1
+        break
+    fi
+    sleep 2
+done
+if [ "$evolve_ok" -ne 1 ]; then
+    ch_type=$($CH_EXEC -q "SELECT type FROM system.columns WHERE database = 'debezium_cdc' AND table = 'products' AND name = 'weight_grams';")
+    echo "  new column propagated: NO (ClickHouse column type: '${ch_type:-<missing>}', value: '${ch_val:-<none>}')"
+    echo
+    echo "CDC verification FAILED -- check the sink task: ./scripts/connector_status.sh (an ACCESS_DENIED trace means clickhouse_etl lacks ALTER ADD COLUMN)." >&2
+    exit 1
+fi
+ch_type=$($CH_EXEC -q "SELECT type FROM system.columns WHERE database = 'debezium_cdc' AND table = 'products' AND name = 'weight_grams';")
+echo "  new column propagated: yes (ClickHouse added weight_grams ${ch_type}, value ${ch_val})"
+
+echo
+echo "== Step 4: gold layer (Flink) matches the same aggregates computed in Postgres =="
 # The source of truth for a gold table is the same query run directly
-# against Postgres. Step 2's changes already exercise retraction (order 1
+# against Postgres. Running after Step 3 also shows the Flink job survives
+# a source schema change (it reads only the columns it declares). Step 2's
+# changes already exercise retraction (order 1
 # cancelled -> leaves daily/category/customer totals) and deletes (an
 # order item removed); the country toggle below adds a dimension change,
 # which has to update an already-joined gold row in place.

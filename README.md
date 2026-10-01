@@ -71,7 +71,7 @@ honest-tradeoffs framing, argued from the other side:
 | **What it actually is** | Log-based CDC into Kafka topics, decoupled from any one sink by a durable, replayable event log | Purpose-built Postgres↔ClickHouse CDC shipping its own orchestration (Temporal) |
 | **When it's the right call** | **Multiple heterogeneous consumers** need the same change stream — a warehouse, a search index, a cache invalidator, an event-driven service. Kafka's replay and fan-out are the entire point, and this setup is one new sink connector away from adding a second consumer without touching the source connector at all. | One sink, and the priority is understanding/testing internals rather than assembling infrastructure that mostly sits idle for a single-consumer workload. |
 | **Operational surface, measured not guessed** | 5 containers for the CDC path itself (Kafka, Kafka Connect, kafka-ui, source, destination), one of which (`kafka-connect`) is a custom-built image combining two independently-versioned connectors — see [`kafka-connect/Dockerfile`](kafka-connect/Dockerfile). Plus 2 Flink containers for the optional gold layer, which a single-sink pipeline doesn't need. | 11 containers (per `stream-cdc-peerdb`'s README), but all vendored as PeerDB's own unmodified control plane — one product, not an assembly. |
-| **Schema management** | Fully manual: destination DDL is hand-written ([`clickhouse/init/02_destination_tables.sql`](clickhouse/init/02_destination_tables.sql)), and automatic `ADD COLUMN` propagation exists (`auto.evolve=true`) but is opt-in *and* requires a grant most least-privilege setups won't have by default — [tested both ways](docs/architecture.md#schema-evolution--tested-both-ways-not-assumed). | Automatic: PeerDB generates destination DDL from the source table and propagates `ADD COLUMN` by default. |
+| **Schema management** | Fully manual: destination DDL is hand-written ([`clickhouse/init/02_destination_tables.sql`](clickhouse/init/02_destination_tables.sql)), and automatic `ADD COLUMN` propagation (`auto.evolve=true`, enabled here) needed an extra grant *and* a tombstone filter to work — [tested both ways](docs/architecture.md#schema-evolution--tested-both-ways-not-assumed). Renames/drops still manual. | Automatic: PeerDB generates destination DDL from the source table and propagates `ADD COLUMN` by default. |
 | **What's genuinely open source, no per-row metering** | Debezium, Kafka, and the ClickHouse sink connector are all Apache-2.0/open source. | PeerDB OSS, also open source and self-hostable. |
 | **Honest cost of this repo's specific choices** | No schema registry/Avro (JSON with embedded schema instead) — a real size/throughput tradeoff, named in Production considerations, not hidden. Debugging surface spans three independently-operated systems (Postgres, Kafka Connect, ClickHouse) instead of one. | Smaller, younger project than Debezium/Kafka, smaller community, less multi-decade track record — `stream-cdc-peerdb`'s own named tradeoff. |
 
@@ -112,8 +112,11 @@ caught it:
   connector genuinely does run `ALTER TABLE ... ADD COLUMN` automatically,
   matching PeerDB — but the first attempt failed loudly on a missing
   ClickHouse grant, and data dropped before enabling it stayed
-  permanently lost even after fixing the grant. Full writeup in
-  `docs/architecture.md`.
+  permanently lost even after fixing the grant. Once it was the default,
+  a third problem surfaced: Debezium's delete tombstones made the sink
+  task fail (`auto.evolve` checks the schema of only the last record in a
+  batch). A tombstone filter fixed it. Now on by default and checked by
+  `verify_cdc.sh` on every run. Full writeup in `docs/architecture.md`.
 - **Failure recovery**: hard-killing `kafka-connect` mid-batch (2,000 rows
   in flight) recovered with the exact row count — no loss, no
   duplicates — once the container came back, and both connectors resumed
@@ -143,10 +146,9 @@ caught it:
   FULL` on the source; without it, Flink can't retract an update. See
   [Streaming gold layer](#streaming-gold-layer-flink).
 - **The ClickHouse sink connector runs under a least-privilege user**, not
-  a shared admin credential — `INSERT, SELECT` only by default, with the
-  exact `ALTER ADD COLUMN` grant PeerDB's own docs require added and
-  tested only for the `auto.evolve=true` experiment, then left out of the
-  default setup.
+  a shared admin credential — `INSERT, SELECT`, plus `ALTER ADD COLUMN`
+  for `auto.evolve` (the same grant PeerDB's own docs require), all
+  scoped to `debezium_cdc`. No drop, modify, or create.
 
 ## Status
 
@@ -279,12 +281,12 @@ scoped `clickhouse_etl` user
 which is what the sink connector actually authenticates as:
 
 ```sql
-GRANT INSERT, SELECT ON debezium_cdc.* TO clickhouse_etl;
+GRANT INSERT, SELECT, ALTER ADD COLUMN ON debezium_cdc.* TO clickhouse_etl;
 ```
 
 Deliberately narrower than PeerDB's grant set — this connector never runs
-`CREATE TABLE`, and only needs `ALTER ADD COLUMN` if `auto.evolve=true` is
-turned on (see the schema-evolution findings above). Destination tables
+`CREATE TABLE`. `ALTER ADD COLUMN` is there because `auto.evolve=true` is
+on (see the schema-evolution findings above). Destination tables
 are pre-created by hand in
 [`clickhouse/init/02_destination_tables.sql`](clickhouse/init/02_destination_tables.sql)
 — unlike PeerDB, the sink connector never creates a table that doesn't
@@ -331,7 +333,12 @@ live insert/update/delete against the source polled against ClickHouse
   update propagated: yes
   delete propagated (soft-delete tombstone): yes
 
-== Step 3: gold layer (Flink) matches the same aggregates computed in Postgres ==
+== Step 3: schema evolution (auto.evolve) -- a new source column reaches ClickHouse ==
+  ALTER TABLE products ADD COLUMN IF NOT EXISTS weight_grams INTEGER; setting product_id=1 to 95745...
+  polling ClickHouse for the new column and value (up to 60s)...
+  new column propagated: yes (ClickHouse added weight_grams Nullable(Int32), value 95745)
+
+== Step 4: gold layer (Flink) matches the same aggregates computed in Postgres ==
   toggling customers.customer_id=4 country (US <-> CA)...
   polling gold tables until they match Postgres (up to 60s)...
   gold.daily_revenue      22 rows, identical to Postgres  OK
@@ -410,14 +417,16 @@ are in
 
 Tested with the feature both off and on, not assumed either way:
 
-- **`auto.evolve=false`** (this pipeline's default): an added source
+- **`auto.evolve=false`** (the original default): an added source
   column is silently dropped for any row synced while the destination
   table doesn't have it — no error, connector task stays `RUNNING`.
-- **`auto.evolve=true`**: the connector runs `ALTER TABLE ... ADD COLUMN`
-  automatically, genuinely matching PeerDB — but it requires an explicit
-  `ALTER ADD COLUMN` grant this pipeline's default least-privilege user
-  doesn't have, and fails the task loudly (not silently) when that grant
-  is missing.
+- **`auto.evolve=true`** (the default now): the connector runs `ALTER
+  TABLE ... ADD COLUMN` automatically, genuinely matching PeerDB. It
+  needs the `ALTER ADD COLUMN` grant (the task fails loudly without it),
+  and it needs Debezium's delete tombstones filtered out of the sink. A
+  batch ending on a tombstone fails the task, because only the last
+  record's schema is checked.
+- **Still not automatic**: renamed or dropped source columns.
 
 ### Failure and recovery
 
@@ -456,13 +465,13 @@ for the full comparison against `MergeTree`/`CollapsingMergeTree`/
   use Avro+Schema Registry; skipped here specifically to control scope for
   this project's Postgres→ClickHouse comparison, not because it doesn't
   matter — named explicitly rather than glossed over.
-- **`auto.evolve=false` by default is a real operational gap**, not just a
-  demo simplification — the tested finding above (an added column silently
-  dropped, task health unaffected) means schema drift needs to be a
-  coordinated migration (pause connectors, alter the destination DDL by
-  hand or turn on `auto.evolve` + the grant it needs, resume), exactly the
-  same discipline `stream-cdc-peerdb` recommends for PeerDB's own drop/
-  rename gap.
+- **`auto.evolve` only covers added columns** — a source column rename
+  or drop still needs a coordinated migration (pause connectors, alter
+  the destination DDL by hand, resume). That's the same discipline
+  `stream-cdc-peerdb` recommends for PeerDB's own drop/rename gap. The
+  sink's DDL rights are also something a stricter shop might not grant at
+  all; turning `auto.evolve` back off brings back silent drops of new
+  columns, so monitoring would then have to catch schema drift.
 - **Single Kafka broker, single Postgres instance, no HA** — a real
   deployment needs a multi-broker Kafka cluster (this project's KRaft setup
   is single-node by design, for local reproducibility) and a Postgres
@@ -520,13 +529,14 @@ clickhouse/
 
 connectors/
   pg-source-connector.json      # Debezium Postgres source connector config
-  ch-sink-connector.json        # ClickHouse sink connector config (debeziumCDCEnabled)
+  ch-sink-connector.json        # ClickHouse sink connector config (debeziumCDCEnabled,
+                                 # auto.evolve, tombstone filter)
 
 scripts/
   register_connectors.sh        # applies connector configs via Connect's REST API
                                  # (injects credentials from .env at registration time)
   deploy_gold.sh                # gold topics, ClickHouse gold DDL, Flink job submit (idempotent)
-  verify_cdc.sh                 # row counts, live insert/update/delete, gold vs. Postgres
+  verify_cdc.sh                 # row counts, live insert/update/delete, new column, gold vs. Postgres
   connector_status.sh           # monitoring: connector/task status, Flink job, consumer lag,
                                  # replication slot size, ClickHouse row counts (silver + gold)
 
