@@ -234,7 +234,7 @@ goes through one subtask, in order.
 
 ### Verified against the live stack
 
-`scripts/verify_cdc.sh` Step 3 recomputes each gold table directly in
+`scripts/verify_cdc.sh` Step 4 recomputes each gold table directly in
 Postgres with plain SQL and requires ClickHouse's `gold.* FINAL` to
 match it row for row, after the Step 2 changes (an order cancelled, an
 order item deleted) plus a customer's country toggled.
@@ -326,7 +326,11 @@ project's own running pipeline, not summarized from documentation.
 
 ### Schema evolution -- tested both ways, not assumed
 
-**With `auto.evolve=false` (this pipeline's shipped default)**: adding a
+This pipeline now ships with `auto.evolve=true` and the `ALTER ADD
+COLUMN` grant it needs; the findings below are what led there, plus one
+more that only showed up once it was the default.
+
+**With `auto.evolve=false` (the original default)**: adding a
 column on the source (`ALTER TABLE products ADD COLUMN weight_grams
 INTEGER`) followed by an `UPDATE` did **not** error, did **not** appear in
 any log as a warning, and did **not** fail the connector task
@@ -367,12 +371,45 @@ explicit `ALTER ADD COLUMN` grant for its own automatic schema evolution
 difference isn't capability, it's default-off vs. default-on, and a hard,
 loud failure instead of PeerDB's silent one when the grant is missing.
 
+**With `auto.evolve=true`, Debezium's delete tombstones kill the sink
+task.** Found when `auto.evolve=true` became the default and
+`verify_cdc.sh` ran its delete with it on, which the original experiment
+never did. After every DELETE, Debezium writes a second message with the
+same key and a null value (a tombstone, so log compaction can drop the
+key). The task failed on the first delete with:
+
+```
+auto.evolve requires a Connect schema (Avro, Protobuf, or JSON Schema).
+Schemaless or string records are not supported with auto.evolve=true.
+```
+
+The cause, in the connector's v1.4.0 source (`ClickHouseWriter.java`):
+with `auto.evolve` on, it reads the field list of only the **last**
+record in each batch and throws if it's empty. A tombstone has no
+fields, so any batch that happens to end on one fails. Whether a given
+delete triggers it depends on where the batch boundary falls. The fix,
+in `connectors/ch-sink-connector.json`, is Kafka Connect's built-in
+`Filter` transform with the `RecordIsTombstone` predicate, which drops
+tombstones before the sink sees them. Nothing is lost: the Debezium
+delete event right before the tombstone is what sets `is_deleted = 1`.
+Filtering in the sink rather than setting `tombstones.on.delete=false`
+on the source leaves the topics unchanged for other consumers (Flink
+already skips tombstones).
+
+The same code comment names a second limitation: only the last record's
+schema is checked. If one batch contains a column's first appearance
+followed by a record without it, the column isn't added for that batch.
+In practice it's added on the next batch, because every later message
+for that table carries the column.
+
 **Practical takeaway**: this connector *can* match PeerDB's automatic
-`ADD COLUMN` behavior, but only if you both opt in (`auto.evolve=true`)
-*and* grant the privilege for it -- neither happens by default, and the
-default failure mode (silently dropping the new field, task otherwise
-healthy) is easy to miss in monitoring that only watches connector/task
-state, because the task never leaves `RUNNING`.
+`ADD COLUMN` behavior, but only with all three: `auto.evolve=true`, the
+`ALTER ADD COLUMN` grant, and tombstones filtered out. None of those are
+defaults. `verify_cdc.sh` Step 3 now checks it on every run: it adds
+`products.weight_grams` in Postgres and requires the column (created as
+`Nullable(Int32)`) and its value to show up in ClickHouse. It still only
+covers *added* columns. A rename or drop on the source is not
+propagated and needs a coordinated migration.
 
 ### Worker crash mid-batch
 

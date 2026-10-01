@@ -9,7 +9,7 @@ help:
 	@echo ""
 	@echo "  make register        Register source + sink connectors (idempotent)"
 	@echo "  make gold            Deploy the Flink gold layer: topics, ClickHouse tables, job (idempotent)"
-	@echo "  make verify          Row counts, live insert/update/delete, gold vs. Postgres check"
+	@echo "  make verify          Row counts, live insert/update/delete, new column, gold vs. Postgres"
 	@echo "  make status          Connector status, consumer lag, WAL retention, row counts"
 	@echo "  make smoke           Full end-to-end smoke test (register + gold + verify)"
 

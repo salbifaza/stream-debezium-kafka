@@ -17,7 +17,13 @@
     "debeziumCDCEnabled": "true",
     "errors.tolerance": "none",
     "exactlyOnce": "false",
-    "auto.evolve": "false",
+    "auto.evolve": "true",
+
+    "transforms": "dropTombstones",
+    "transforms.dropTombstones.type": "org.apache.kafka.connect.transforms.Filter",
+    "transforms.dropTombstones.predicate": "isTombstone",
+    "predicates": "isTombstone",
+    "predicates.isTombstone.type": "org.apache.kafka.connect.transforms.predicates.RecordIsTombstone",
 
     "key.converter": "org.apache.kafka.connect.json.JsonConverter",
     "key.converter.schemas.enable": "false",
