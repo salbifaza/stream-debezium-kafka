@@ -1,4 +1,4 @@
-.PHONY: help up down reset logs register verify status smoke
+.PHONY: help up down reset logs register gold verify status smoke
 
 help:
 	@echo "Usage:"
@@ -8,9 +8,10 @@ help:
 	@echo "  make logs            Tail all service logs"
 	@echo ""
 	@echo "  make register        Register source + sink connectors (idempotent)"
-	@echo "  make verify          Row-count check + live insert/update/delete test"
+	@echo "  make gold            Deploy the Flink gold layer: topics, ClickHouse tables, job (idempotent)"
+	@echo "  make verify          Row counts, live insert/update/delete, gold vs. Postgres check"
 	@echo "  make status          Connector status, consumer lag, WAL retention, row counts"
-	@echo "  make smoke           Full end-to-end smoke test (register + verify)"
+	@echo "  make smoke           Full end-to-end smoke test (register + gold + verify)"
 
 # ── infrastructure ────────────────────────────────────────────────────────────
 
@@ -19,9 +20,11 @@ up:
 	docker compose up -d --build
 	@echo "Waiting for Kafka Connect to become healthy..."
 	@./scripts/register_connectors.sh
+	@./scripts/deploy_gold.sh
 	@echo ""
 	@echo "Stack ready."
 	@echo "  kafka-ui: http://localhost:8086"
+	@echo "  Flink UI: http://localhost:8088"
 	@echo "  Kafka Connect REST: http://localhost:8087"
 	@echo "  Source Postgres: localhost:5433"
 	@echo "  ClickHouse HTTP: localhost:8124"
@@ -43,6 +46,9 @@ logs:
 register:
 	./scripts/register_connectors.sh
 
+gold:
+	./scripts/deploy_gold.sh
+
 verify:
 	./scripts/verify_cdc.sh
 
@@ -51,4 +57,4 @@ status:
 
 # ── testing ───────────────────────────────────────────────────────────────────
 
-smoke: register verify
+smoke: register gold verify

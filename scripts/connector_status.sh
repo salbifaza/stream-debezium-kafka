@@ -9,6 +9,7 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 CONNECT_URL="${CONNECT_URL:-http://localhost:8087}"
+FLINK_URL="${FLINK_URL:-http://localhost:8088}"
 COMPOSE="docker compose"
 
 echo "== Connector + task status (Kafka Connect REST API) =="
@@ -21,6 +22,20 @@ echo "== Consumer lag: ecommerce-ch-sink's consumer group (per topic-partition) 
 $COMPOSE exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
     --bootstrap-server localhost:9092 \
     --describe --group connect-ecommerce-ch-sink 2>&1 || echo "  (consumer group not found yet -- sink connector may not have started consuming)"
+
+echo
+echo "== Flink gold job (Flink REST API) =="
+curl -sf "${FLINK_URL}/jobs/overview" \
+    | jq -r '.jobs[] | "  \(.name)  \(.state)  started \(.["start-time"] / 1000 | todate)"' \
+    || echo "  (Flink not reachable at ${FLINK_URL})"
+
+echo
+echo "== Consumer lag: ClickHouse gold consumers (gold.* topics) =="
+for g in daily_revenue category_revenue customer_ltv; do
+    $COMPOSE exec -T kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+        --bootstrap-server localhost:9092 \
+        --describe --group "clickhouse-gold-${g}" 2>&1 | grep -v '^$' || true
+done
 
 echo
 echo "== Replication slot size on source (grows if the pipeline falls behind or stalls) =="
@@ -38,3 +53,11 @@ UNION ALL SELECT 'orders', count() FROM debezium_cdc.orders FINAL WHERE is_delet
 UNION ALL SELECT 'order_items', count() FROM debezium_cdc.order_items FINAL WHERE is_deleted = 0
 UNION ALL SELECT 'payments', count() FROM debezium_cdc.payments FINAL WHERE is_deleted = 0
 FORMAT PrettyCompact;"
+
+echo
+echo "== Gold row counts in ClickHouse (FINAL hides retracted rows) =="
+$COMPOSE exec -T clickhouse clickhouse-client --user "${CLICKHOUSE_USER:-ch_admin}" --password "${CLICKHOUSE_PASSWORD:-ch_admin_password}" -q "
+SELECT 'daily_revenue' AS t, count() FROM gold.daily_revenue FINAL
+UNION ALL SELECT 'category_revenue', count() FROM gold.category_revenue FINAL
+UNION ALL SELECT 'customer_ltv', count() FROM gold.customer_ltv FINAL
+FORMAT PrettyCompact;" 2>&1 || echo "  (gold database not created yet -- run 'make gold')"

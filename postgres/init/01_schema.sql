@@ -72,6 +72,21 @@ CREATE INDEX idx_order_items_order ON order_items(order_id);
 CREATE INDEX idx_order_items_product ON order_items(product_id);
 CREATE INDEX idx_payments_order ON payments(order_id);
 
+-- REPLICA IDENTITY FULL: write the complete old row into the WAL on every
+-- UPDATE/DELETE, so Debezium's `before` field carries the whole previous
+-- row instead of null (UPDATE) or just the primary key (DELETE). The
+-- ClickHouse sink doesn't need this, but the Flink gold layer
+-- (flink/sql/gold.sql) does: to retract an old value from an aggregate it
+-- must know what that value was, and Flink's debezium-json format rejects
+-- UPDATE events whose `before` is null. Cost: larger WAL on updates and
+-- deletes, since the full old row is logged.
+ALTER TABLE categories  REPLICA IDENTITY FULL;
+ALTER TABLE customers   REPLICA IDENTITY FULL;
+ALTER TABLE products    REPLICA IDENTITY FULL;
+ALTER TABLE orders      REPLICA IDENTITY FULL;
+ALTER TABLE order_items REPLICA IDENTITY FULL;
+ALTER TABLE payments    REPLICA IDENTITY FULL;
+
 -- A dedicated publication naming the exact tables we want the Debezium
 -- Postgres connector to capture. Deliberate, same discipline as the PeerDB
 -- project: `publication.autocreate.mode=disabled` in
