@@ -9,7 +9,7 @@ on:
 jobs:
   smoke:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
 
@@ -20,6 +20,9 @@ jobs:
 
       - name: Register connectors
         run: ./scripts/register_connectors.sh
+
+      - name: Deploy gold layer (Flink)
+        run: ./scripts/deploy_gold.sh
 
       - name: Verify CDC pipeline
         run: ./scripts/verify_cdc.sh

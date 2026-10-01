@@ -45,6 +45,7 @@ script or doc section that proves it.
 | Operational maturity — monitoring, alerting signals, failure injection with evidence | [Stage 4](#stage-4-operations-monitoring-schema-evolution-failure-recovery) |
 | Security by default (least-privilege access, credential separation) | [ClickHouse configuration](#clickhouse-configuration) |
 | Data-integrity edge cases found by testing, both with a feature off and on | [schema evolution findings](docs/architecture.md#schema-evolution--tested-both-ways-not-assumed) |
+| Streaming aggregation over a CDC changelog (retractions, joins, deletes) instead of insert-only MVs | [Streaming gold layer](#streaming-gold-layer-flink) |
 | Honest scope framing — naming what isn't production-ready | [Production considerations](#production-considerations-what-id-change-for-real) |
 
 See [`docs/architecture.md`](docs/architecture.md) for the full mechanics,
@@ -69,7 +70,7 @@ honest-tradeoffs framing, argued from the other side:
 |---|---|---|
 | **What it actually is** | Log-based CDC into Kafka topics, decoupled from any one sink by a durable, replayable event log | Purpose-built Postgres↔ClickHouse CDC shipping its own orchestration (Temporal) |
 | **When it's the right call** | **Multiple heterogeneous consumers** need the same change stream — a warehouse, a search index, a cache invalidator, an event-driven service. Kafka's replay and fan-out are the entire point, and this setup is one new sink connector away from adding a second consumer without touching the source connector at all. | One sink, and the priority is understanding/testing internals rather than assembling infrastructure that mostly sits idle for a single-consumer workload. |
-| **Operational surface, measured not guessed** | 5 containers this repo actually runs (Kafka, Kafka Connect, kafka-ui, source, destination), one of which (`kafka-connect`) is a custom-built image combining two independently-versioned connectors — see [`kafka-connect/Dockerfile`](kafka-connect/Dockerfile). | 11 containers (per `stream-cdc-peerdb`'s README), but all vendored as PeerDB's own unmodified control plane — one product, not an assembly. |
+| **Operational surface, measured not guessed** | 5 containers for the CDC path itself (Kafka, Kafka Connect, kafka-ui, source, destination), one of which (`kafka-connect`) is a custom-built image combining two independently-versioned connectors — see [`kafka-connect/Dockerfile`](kafka-connect/Dockerfile). Plus 2 Flink containers for the optional gold layer, which a single-sink pipeline doesn't need. | 11 containers (per `stream-cdc-peerdb`'s README), but all vendored as PeerDB's own unmodified control plane — one product, not an assembly. |
 | **Schema management** | Fully manual: destination DDL is hand-written ([`clickhouse/init/02_destination_tables.sql`](clickhouse/init/02_destination_tables.sql)), and automatic `ADD COLUMN` propagation exists (`auto.evolve=true`) but is opt-in *and* requires a grant most least-privilege setups won't have by default — [tested both ways](docs/architecture.md#schema-evolution--tested-both-ways-not-assumed). | Automatic: PeerDB generates destination DDL from the source table and propagates `ADD COLUMN` by default. |
 | **What's genuinely open source, no per-row metering** | Debezium, Kafka, and the ClickHouse sink connector are all Apache-2.0/open source. | PeerDB OSS, also open source and self-hostable. |
 | **Honest cost of this repo's specific choices** | No schema registry/Avro (JSON with embedded schema instead) — a real size/throughput tradeoff, named in Production considerations, not hidden. Debugging surface spans three independently-operated systems (Postgres, Kafka Connect, ClickHouse) instead of one. | Smaller, younger project than Debezium/Kafka, smaller community, less multi-decade track record — `stream-cdc-peerdb`'s own named tradeoff. |
@@ -78,8 +79,10 @@ honest-tradeoffs framing, argued from the other side:
 specific problem — one source, one sink — PeerDB's integrated approach
 does less incidental work for the same result, which is exactly what
 `stream-cdc-peerdb` claimed. Debezium+Kafka Connect earns its complexity
-back the moment a second consumer shows up, which this repo doesn't
-have — and the schema-evolution and worker-recovery findings below show
+back the moment a second consumer shows up. The
+[Flink gold layer](#streaming-gold-layer-flink) is that second consumer:
+it was added without touching the source connector or the ClickHouse
+sink. The schema-evolution and worker-recovery findings below show
 concretely *where* that extra assembly cost actually shows up in practice,
 not just in principle.
 
@@ -128,6 +131,17 @@ caught it:
   otherwise-idle source. A logical slot's `restart_lsn` needs a fresh
   `xl_running_xacts` WAL record to compute a new restart candidate;
   confirmation + checkpoints alone aren't sufficient on a quiet source.
+- **A streaming gold layer that stays exactly equal to the source.**
+  A Flink SQL job reads the same Debezium topics as a second consumer
+  and maintains three aggregates (daily revenue, revenue per category,
+  customer lifetime value) in ClickHouse. `verify_cdc.sh` recomputes each
+  one in Postgres and requires a row-for-row match after an order
+  cancellation, an item delete, and a customer moving country. Postgres
+  `UPDATE` to changed gold row: 1.4–2.5s. Gold stayed correct through a
+  killed Flink taskmanager (restored from checkpoint) and a cancelled and
+  resubmitted job (full replay). Getting there needed `REPLICA IDENTITY
+  FULL` on the source; without it, Flink can't retract an update. See
+  [Streaming gold layer](#streaming-gold-layer-flink).
 - **The ClickHouse sink connector runs under a least-privilege user**, not
   a shared admin credential — `INSERT, SELECT` only by default, with the
   exact `ALTER ADD COLUMN` grant PeerDB's own docs require added and
@@ -141,26 +155,28 @@ caught it:
 - [x] Stage 3 — Registering connectors, verifying insert/update/delete flow
 - [x] Stage 4 — Monitoring, schema evolution (both modes), failure
       recovery, WAL retention
+- [x] Stage 5 — Streaming gold layer (Flink), verified against Postgres
 
 ## Prerequisites
 
 - Docker + Docker Compose v2 (`docker compose version`)
-- ~3 GB free RAM for the stack (5 containers: Kafka, Kafka Connect,
-  kafka-ui, source Postgres, ClickHouse)
-- Ports free on the host: `5433, 8124, 9010, 9094, 8087, 8086` — all
+- ~5 GB free RAM for the stack (7 containers: Kafka, Kafka Connect,
+  kafka-ui, source Postgres, ClickHouse, Flink jobmanager + taskmanager)
+- Ports free on the host: `5433, 8124, 9010, 9094, 8087, 8086, 8088` — all
   chosen to avoid every port `stream-cdc-peerdb` uses, so **both stacks
   can run at the same time** for a direct side-by-side comparison
 
 ## Quickstart
 
 ```bash
-make up       # starts everything + registers connectors automatically
-make verify   # row-count check + live insert/update/delete test
+make up       # starts everything, registers connectors, deploys the gold layer
+make verify   # row counts, live insert/update/delete, gold vs. Postgres
 ```
 
 That's it. `make up` starts the full stack (Kafka, Kafka Connect,
-Postgres, ClickHouse, kafka-ui), waits for Kafka Connect to become
-healthy, and registers both connectors. `make verify` runs the end-to-end
+Postgres, ClickHouse, kafka-ui, Flink), waits for Kafka Connect to become
+healthy, registers both connectors, and deploys the Flink gold job
+(`make gold` on its own is idempotent). `make verify` runs the end-to-end
 CDC verification.
 
 First run pulls Kafka, Kafka Connect's base image, ClickHouse, and
@@ -171,7 +187,7 @@ your connection.
 Other useful targets:
 
 ```bash
-make status   # connector/task status, consumer lag, WAL retention, row counts
+make status   # connector/task + Flink job status, consumer lag, WAL retention, row counts
 make logs     # tail all service logs
 make down     # stop, keep data volumes
 make reset    # stop and wipe all state (full rebuild on next make up)
@@ -202,10 +218,17 @@ flowchart LR
         CH[(ClickHouse<br/>debezium_cdc db)]
     end
 
+    subgraph Flink["Flink (session cluster)"]
+        JOB[SQL job ecommerce-gold<br/>debezium-json changelog]
+    end
+
     SLOT -- streamed changes --> SRC
     SRC -- envelope JSON<br/>op/before/after/source --> TOPICS
     TOPICS -- consume --> SINK
     SINK -- INSERT<br/>+ _version/is_deleted --> CH
+    TOPICS -- consume --> JOB
+    JOB -- retract/emit --> GOLDT[[gold.* topics]]
+    GOLDT -- Kafka engine + MV<br/>_version = offset --> GOLD[(ClickHouse<br/>gold db)]
 
     UI[kafka-ui :8086] -.observes.-> Broker
     UI -.observes.-> Connect
@@ -224,7 +247,8 @@ failure-mode findings, and every design decision in detail.
 | `dbz-kafka-connect` | Custom image: Debezium's Connect image + the ClickHouse sink connector plugin (`kafka-connect/Dockerfile`) | `8087` (REST API) |
 | `dbz-kafka-ui` | Topics, consumer lag, connector/task status in one dashboard | `8086` |
 | `dbz-source-postgres` | The OLTP source being captured — same schema as `stream-cdc-peerdb` | `5433` |
-| `dbz-clickhouse` | The OLAP destination | `8124` (HTTP), `9010` (native) |
+| `dbz-clickhouse` | The OLAP destination (`debezium_cdc` silver tables, `gold` aggregates) | `8124` (HTTP), `9010` (native) |
+| `dbz-flink-jobmanager` / `dbz-flink-taskmanager` | Flink session cluster running the gold SQL job (`flink/Dockerfile` adds the Kafka connector) | `8088` (web UI + REST) |
 
 Full mechanics, including *why* the ClickHouse sink connector doesn't need
 a flattening transform and the KRaft env var setup, are in
@@ -307,6 +331,14 @@ live insert/update/delete against the source polled against ClickHouse
   update propagated: yes
   delete propagated (soft-delete tombstone): yes
 
+== Step 3: gold layer (Flink) matches the same aggregates computed in Postgres ==
+  toggling customers.customer_id=4 country (US <-> CA)...
+  polling gold tables until they match Postgres (up to 60s)...
+  gold.daily_revenue      22 rows, identical to Postgres  OK
+  gold.category_revenue    5 rows, identical to Postgres  OK
+  gold.customer_ltv       15 rows, identical to Postgres  OK
+  gold converged within ~2s of the last source change.
+
 CDC verification PASSED.
 ```
 
@@ -331,6 +363,42 @@ SELECT * FROM debezium_cdc.order_items FINAL WHERE is_deleted = 0;
   `mirror_status.sh` queries one (`peerdb_stats`) — a concrete
   illustration of the "one product vs. assembled parts" tradeoff from the
   comparison table above.
+
+## Streaming gold layer (Flink)
+
+`debezium_cdc.*` mirrors the source tables (silver). The `gold` database
+holds business aggregates kept current by a Flink SQL job
+([`flink/sql/gold.sql`](flink/sql/gold.sql)):
+
+| Table | Grain | What changes it |
+|---|---|---|
+| `gold.daily_revenue` | order day (UTC) | new/cancelled orders |
+| `gold.category_revenue` | category | line items added/deleted, orders cancelled, products recategorised, categories renamed |
+| `gold.customer_ltv` | customer | orders, plus the customer's own email/country |
+
+```sql
+SELECT * FROM gold.customer_ltv FINAL ORDER BY lifetime_value_cents DESC;
+```
+
+`FINAL` is all you need: retracted rows are hidden by
+`ReplacingMergeTree(_version, is_deleted)`.
+
+**Why Flink rather than a ClickHouse materialized view:** an MV only
+sees inserted rows, so on CDC data it counts every update again, never
+subtracts a delete, and ignores changes to the right-hand side of a
+join. Flink reads Debezium's topics as a changelog (each update is a
+retraction of the old row plus the new row) and corrects its aggregates
+and joins to match. Kafka is what makes this cheap to add. Flink is a
+second consumer of topics that already exist, and neither the source
+connector nor the ClickHouse sink changed.
+
+The path: Debezium topics → Flink → `gold.*` topics (debezium-json) →
+ClickHouse Kafka engine + MV → `gold.*` tables, using the Kafka offset as
+the row version. Why each of those choices was made (including
+`REPLICA IDENTITY FULL` on the source), the failure tests, and the
+limits are in
+[`docs/architecture.md`](docs/architecture.md#streaming-gold-layer-flink).
+Flink UI: `localhost:8088`.
 
 ## Stage 4: operations (monitoring, schema evolution, failure recovery)
 
@@ -404,6 +472,13 @@ for the full comparison against `MergeTree`/`CollapsingMergeTree`/
   manual/cron tool. A real deployment would ship Kafka Connect REST
   status, consumer lag, and `pg_replication_slots` size to
   Prometheus/Grafana with real paging thresholds.
+- **The Flink job has no HA and unbounded state** — a cluster restart
+  means `deploy_gold.sh` resubmits the job and replays every source topic
+  (correct, but slow at real volume), and its regular joins keep every
+  row in state forever. For real: the Flink Kubernetes operator with HA
+  and savepoints, and `table.exec.state.ttl` or interval joins. Also
+  `REPLICA IDENTITY FULL` grows WAL on every update/delete, which needs
+  sizing on a write-heavy source.
 - **Table volumes here are tiny by design** (tens to low thousands of
   rows) — this proves correctness and behavior, not throughput. Kafka
   partition count, Connect task parallelism (`tasks.max`), and ClickHouse
@@ -421,7 +496,7 @@ make reset     # stop and wipe all data (start fresh on next make up)
 
 ```
 docker-compose.yml            # full stack: Kafka (KRaft) + Kafka Connect (custom image)
-                               # + kafka-ui + source Postgres + ClickHouse
+                               # + kafka-ui + source Postgres + ClickHouse + Flink
 Makefile                      # all commands: up, verify, status, reset
 .env.example                  # copy to .env; override credentials here
 LICENSE                       # MIT
@@ -429,14 +504,19 @@ LICENSE                       # MIT
 kafka-connect/
   Dockerfile                  # Debezium's Connect image + ClickHouse sink connector plugin
 
+flink/
+  Dockerfile                  # Flink 2.2 + Kafka SQL connector
+  sql/gold.sql                # gold job: Debezium topics -> aggregates -> gold.* topics
+
 postgres/
   init/00_pg-hba-replication.sh # allows replication connections from Kafka Connect
-  init/01_schema.sql            # e-commerce schema + publication (same data as stream-cdc-peerdb)
+  init/01_schema.sql            # e-commerce schema + publication + REPLICA IDENTITY FULL
   init/02_seed.sql              # identical seed data to stream-cdc-peerdb
 
 clickhouse/
   init/01_clickhouse_etl_user.sh # provisions the least-privilege clickhouse_etl user
   init/02_destination_tables.sql # hand-written ReplacingMergeTree DDL, one per table
+  gold.sql                       # gold tables + Kafka engine consumers (applied by deploy_gold.sh)
 
 connectors/
   pg-source-connector.json      # Debezium Postgres source connector config
@@ -445,9 +525,10 @@ connectors/
 scripts/
   register_connectors.sh        # applies connector configs via Connect's REST API
                                  # (injects credentials from .env at registration time)
-  verify_cdc.sh                 # row-count check + live insert/update/delete test
-  connector_status.sh           # monitoring: connector/task status, consumer lag,
-                                 # replication slot size, ClickHouse row counts
+  deploy_gold.sh                # gold topics, ClickHouse gold DDL, Flink job submit (idempotent)
+  verify_cdc.sh                 # row counts, live insert/update/delete, gold vs. Postgres
+  connector_status.sh           # monitoring: connector/task status, Flink job, consumer lag,
+                                 # replication slot size, ClickHouse row counts (silver + gold)
 
 docs/
   architecture.md               # CDC mechanics, diagram, engine rationale,

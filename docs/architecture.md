@@ -68,6 +68,12 @@ general-purpose parts:
   both Kafka and the Connect REST API.
 - **`source-postgres`** / **`clickhouse`** -- same roles, same schema, same
   seed data as stream-cdc-peerdb.
+- **`flink-jobmanager`** / **`flink-taskmanager`** -- a Flink session
+  cluster running one SQL job that computes the gold layer from the same
+  Debezium topics the ClickHouse sink reads. It has no counterpart in
+  stream-cdc-peerdb, and that's the point: it's a second, independent
+  consumer of the change stream, added without touching the source
+  connector. See [Streaming gold layer](#streaming-gold-layer-flink).
 
 **No schema registry, no Avro** -- a deliberate, named scope cut (see
 "Production considerations" in the README), not an oversight. Both
@@ -145,6 +151,133 @@ this file has to exist and be correct *before* the connector starts, or the
 connector fails outright (`errors.tolerance=none`) rather than improvising
 a schema.
 
+## Streaming gold layer (Flink)
+
+`debezium_cdc.*` is a silver layer: one ClickHouse table per source
+table, correct when read with `FINAL WHERE is_deleted = 0`. The gold
+layer is three business aggregates -- `gold.daily_revenue`,
+`gold.category_revenue`, `gold.customer_ltv` -- kept up to date as the
+source changes, within a couple of seconds.
+
+### Why not a ClickHouse materialized view
+
+The obvious approach is an incremental ClickHouse MV (e.g. into
+`SummingMergeTree`) on top of `debezium_cdc.orders`. It gives wrong
+answers on CDC data, because an MV only ever sees each newly-inserted
+block:
+
+- An UPDATE arrives as a new row version. The MV adds it again and never
+  subtracts the old one, so an order that goes `pending -> paid ->
+  shipped` is counted three times.
+- A DELETE arrives as a row with `is_deleted = 1`. The MV can't subtract
+  it.
+- A join in an MV fires only on inserts to its left-hand table. Renaming
+  a category or moving a customer to another country doesn't touch any
+  gold row already joined.
+
+A refreshable MV (recompute everything every N seconds) is correct but
+is batch, not streaming. Flink is the option that's both correct and
+incremental.
+
+### How it works
+
+```
+ecommerce.public.* ──> Flink SQL job ──> gold.* topics ──> ClickHouse Kafka engine ──> gold.* tables
+ (Debezium envelope)    (flink/sql/       (debezium-json)   + MV (clickhouse/gold.sql)   ReplacingMergeTree
+                         gold.sql)                                                        (_version, is_deleted)
+```
+
+1. **Flink reads the change topics as a changelog.** The `debezium-json`
+   format turns each Debezium event into Flink row kinds: snapshot/insert
+   -> `+I`, update -> `-U` (old row) and `+U` (new row), delete -> `-D`.
+   Aggregates and joins consume the retractions and emit corrected
+   results. Cancelling order 1 retracts its revenue from its day, its
+   categories, and its customer's lifetime value.
+2. **That needs the full old row**, so every source table is
+   `REPLICA IDENTITY FULL` (`postgres/init/01_schema.sql`). With the
+   default identity, Debezium's `before` is null on UPDATE and only the
+   primary key on DELETE. Flink's debezium-json format rejects the
+   UPDATE outright (an aggregate can't retract a value it never saw).
+   The cost is a larger WAL on updates and deletes.
+3. **Flink writes gold back to Kafka as debezium-json, not upsert-kafka.**
+   Upsert-kafka represents a delete as a null-value tombstone. The
+   ClickHouse Kafka Connect sink maps a null value to a record with no
+   fields, never to a delete (`Record.getConvertor` ->
+   `EmptyRecordConvertor` in the connector's v1.4.0 source). A tombstone
+   also has no body for a Kafka-engine MV to read a key or delete flag
+   from. Either way, a gold row that should disappear wouldn't. Flink's
+   debezium-json output encodes a delete as
+   `{"op":"d","before":{...}}`, which is an ordinary message. (I chose
+   this from reading the code and did not test the tombstone path.)
+4. **ClickHouse ingests with its Kafka table engine, not a second sink
+   connector.** The sink connector's Debezium mode needs a
+   *source-connector* envelope: it reads `source.lsn` for `_version`,
+   which Flink's output doesn't have. The Kafka engine exposes each
+   message's `_offset` instead, and the MV uses it as `_version`. Flink
+   partitions each gold topic by the gold row's key (`key.fields`), so
+   every change to one row lands in one partition, where offsets are
+   strictly increasing. An updated row arrives as `d` then `c`, and the
+   `c` has the higher offset, so it wins.
+5. **`ReplacingMergeTree(_version, is_deleted)`**, using the engine's
+   built-in delete flag rather than a plain column as in `debezium_cdc`.
+   `SELECT ... FROM gold.x FINAL` is enough; deleted rows are already
+   hidden.
+
+**Gold queries aggregate on the gold row's own key, then join attributes
+on.** `customer_ltv` groups orders by `customer_id` and only then joins
+email/country. Grouping by `(customer_id, country)` would also be
+correct, but it turns a country change into "delete the row under the
+old key, insert under the new key". Those are two keys, which at
+parallelism > 1 may be processed by different subtasks and reach Kafka
+in either order. Keyed this way, every change to a customer's gold row
+goes through one subtask, in order.
+
+### Verified against the live stack
+
+`scripts/verify_cdc.sh` Step 3 recomputes each gold table directly in
+Postgres with plain SQL and requires ClickHouse's `gold.* FINAL` to
+match it row for row, after the Step 2 changes (an order cancelled, an
+order item deleted) plus a customer's country toggled.
+
+- **Correctness**: all three gold tables matched Postgres exactly on the
+  first run. `daily_revenue` went from 23 to 22 rows, because cancelling
+  order 1 left its day with no orders. That's a gold-row delete
+  propagating, not only updates.
+- **Latency**: a Postgres `UPDATE` showing up in `gold.customer_ltv`
+  took 1.4-2.5s across three runs (polling ClickHouse every 100ms). The
+  biggest term was ClickHouse's Kafka engine flush interval. At its 7.5s
+  default the same check took ~6s, so `clickhouse/gold.sql` sets
+  `kafka_flush_interval_ms = 1000`.
+- **Taskmanager killed mid-stream** (`docker kill`), then an order
+  cancelled and an item deleted while it was down: the job sat in
+  `RESTARTING`, and once the taskmanager was started again it restored
+  from its last checkpoint and gold matched Postgres within ~2s.
+- **Job cancelled and resubmitted** (no savepoint, as after a Flink
+  cluster restart): the new job re-read every source topic from the
+  start and re-emitted the full gold history. Max `_version` in
+  `gold.customer_ltv` went 122 -> 247, and the final state matched
+  Postgres, because replayed messages carry newer offsets.
+
+### Limits
+
+- **Flink state grows without bound.** Regular joins keep both sides in
+  state forever. Fine for this data size. In production you'd set
+  `table.exec.state.ttl` (accepting that very old rows stop being
+  retractable) or move to interval/temporal joins where the semantics
+  allow.
+- **No HA and no savepoints.** A Flink cluster restart loses the job.
+  `scripts/deploy_gold.sh` resubmits it, which means a full replay of
+  every source topic. That's correct, but at real volumes you'd run the
+  Flink Kubernetes operator with HA and restore from savepoints.
+- **At-least-once into gold topics.** After a failure, Flink re-emits
+  output since the last checkpoint. ClickHouse's offset-as-version makes
+  that harmless for the final state, but a consumer of the raw `gold.*`
+  topics will see duplicates.
+- **Source topics are retained by time** (Kafka's 7-day default), so a
+  full replay only works while the full history is still in Kafka.
+  Making the Debezium topics compacted, or re-snapshotting, would be
+  needed beyond that.
+
 ## Data flow diagram
 
 ```mermaid
@@ -170,10 +303,17 @@ flowchart LR
         CH[(ClickHouse<br/>debezium_cdc db)]
     end
 
+    subgraph Flink["Flink (session cluster)"]
+        JOB[SQL job ecommerce-gold<br/>debezium-json changelog]
+    end
+
     SLOT -- streamed changes --> SRC
     SRC -- envelope JSON<br/>op/before/after/source --> TOPICS
     TOPICS -- consume --> SINK
     SINK -- INSERT<br/>+ _version/is_deleted --> CH
+    TOPICS -- consume --> JOB
+    JOB -- retract/emit --> GOLDT[[gold.* topics]]
+    GOLDT -- Kafka engine + MV<br/>_version = offset --> GOLD[(ClickHouse<br/>gold db)]
 
     UI[kafka-ui :8086] -.observes.-> Broker
     UI -.observes.-> Connect

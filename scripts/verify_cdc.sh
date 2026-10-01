@@ -60,12 +60,87 @@ printf "  insert propagated: %s\n" "$([ "$insert_ok" -eq 1 ] && echo yes || echo
 printf "  update propagated: %s\n" "$([ "$update_ok" -eq 1 ] && echo yes || echo NO)"
 printf "  delete propagated (soft-delete tombstone): %s\n" "$([ "$delete_ok" -eq 1 ] && echo yes || echo NO)"
 
-if [ "$insert_ok" -eq 1 ] && [ "$update_ok" -eq 1 ] && [ "$delete_ok" -eq 1 ]; then
-    echo
-    echo "CDC verification PASSED."
-    exit 0
-else
+if [ "$insert_ok" -ne 1 ] || [ "$update_ok" -ne 1 ] || [ "$delete_ok" -ne 1 ]; then
     echo
     echo "CDC verification FAILED -- one or more changes did not propagate within 60s." >&2
     exit 1
 fi
+
+echo
+echo "== Step 3: gold layer (Flink) matches the same aggregates computed in Postgres =="
+# The source of truth for a gold table is the same query run directly
+# against Postgres. Step 2's changes already exercise retraction (order 1
+# cancelled -> leaves daily/category/customer totals) and deletes (an
+# order item removed); the country toggle below adds a dimension change,
+# which has to update an already-joined gold row in place.
+echo "  toggling customers.customer_id=4 country (US <-> CA)..."
+$PG_EXEC -c "UPDATE customers SET country = CASE country WHEN 'US' THEN 'CA' ELSE 'US' END, updated_at = now() WHERE customer_id = 4;" >/dev/null
+changed_at=$SECONDS
+
+# Each pair renders the same rows as identical 'a|b|c' lines, in the same order.
+PG_DAILY="SELECT d || '|' || n || '|' || r FROM (
+    SELECT (created_at AT TIME ZONE 'UTC')::date::text AS d, count(*) AS n, sum(order_total_cents) AS r
+    FROM orders WHERE status <> 'cancelled' GROUP BY 1) x ORDER BY d;"
+CH_DAILY="SELECT concat(toString(order_date), '|', toString(orders_count), '|', toString(revenue_cents))
+    FROM gold.daily_revenue FINAL ORDER BY order_date;"
+
+PG_CATEGORY="SELECT c.category_id || '|' || c.name || '|' || s.units || '|' || s.rev FROM (
+    SELECT p.category_id, sum(oi.quantity) AS units, sum(oi.quantity * oi.unit_price_cents) AS rev
+    FROM order_items oi JOIN orders o USING (order_id) JOIN products p USING (product_id)
+    WHERE o.status <> 'cancelled' GROUP BY p.category_id) s
+    JOIN categories c USING (category_id) ORDER BY c.category_id;"
+CH_CATEGORY="SELECT concat(toString(category_id), '|', category_name, '|', toString(units_sold), '|', toString(revenue_cents))
+    FROM gold.category_revenue FINAL ORDER BY category_id;"
+
+PG_LTV="SELECT cu.customer_id || '|' || cu.email || '|' || cu.country || '|' || coalesce(a.n, 0) || '|' || coalesce(a.v, 0)
+    FROM customers cu LEFT JOIN (
+        SELECT customer_id, count(*) AS n, sum(order_total_cents) AS v
+        FROM orders WHERE status <> 'cancelled' GROUP BY customer_id) a USING (customer_id)
+    ORDER BY cu.customer_id;"
+CH_LTV="SELECT concat(toString(customer_id), '|', email, '|', country, '|', toString(orders_count), '|', toString(lifetime_value_cents))
+    FROM gold.customer_ltv FINAL ORDER BY customer_id;"
+
+GOLD_TABLES=(daily_revenue category_revenue customer_ltv)
+declare -A PG_Q=([daily_revenue]="$PG_DAILY" [category_revenue]="$PG_CATEGORY" [customer_ltv]="$PG_LTV")
+declare -A CH_Q=([daily_revenue]="$CH_DAILY" [category_revenue]="$CH_CATEGORY" [customer_ltv]="$CH_LTV")
+declare -A gold_ok=([daily_revenue]=0 [category_revenue]=0 [customer_ltv]=0)
+
+echo "  polling gold tables until they match Postgres (up to 60s)..."
+deadline=$((SECONDS + 60))
+while [ $SECONDS -lt $deadline ]; do
+    all_ok=1
+    for g in "${GOLD_TABLES[@]}"; do
+        if [ "${gold_ok[$g]}" -eq 0 ]; then
+            if [ "$($PG_EXEC -c "${PG_Q[$g]}")" = "$($CH_EXEC -q "${CH_Q[$g]}" 2>/dev/null)" ]; then
+                gold_ok[$g]=1
+            else
+                all_ok=0
+            fi
+        fi
+    done
+    [ "$all_ok" -eq 1 ] && break
+    sleep 1
+done
+elapsed=$((SECONDS - changed_at))
+
+gold_fail=0
+for g in "${GOLD_TABLES[@]}"; do
+    rows=$($PG_EXEC -c "${PG_Q[$g]}" | wc -l)
+    if [ "${gold_ok[$g]}" -eq 1 ]; then
+        printf "  gold.%-17s %3s rows, identical to Postgres  OK\n" "$g" "$rows"
+    else
+        printf "  gold.%-17s MISMATCH -- diff (< postgres, > clickhouse):\n" "$g"
+        diff <($PG_EXEC -c "${PG_Q[$g]}") <($CH_EXEC -q "${CH_Q[$g]}" 2>&1) | sed 's/^/      /' || true
+        gold_fail=1
+    fi
+done
+
+if [ "$gold_fail" -ne 0 ]; then
+    echo
+    echo "CDC verification FAILED -- gold layer did not converge within 60s. Check 'make status' and the Flink UI (http://localhost:8088)." >&2
+    exit 1
+fi
+
+echo "  gold converged within ~${elapsed}s of the last source change."
+echo
+echo "CDC verification PASSED."

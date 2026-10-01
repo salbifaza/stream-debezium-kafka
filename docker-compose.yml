@@ -165,10 +165,63 @@ services:
       kafka:
         condition: service_healthy
 
+  # ---------------------------------------------------------------------
+  # Flink session cluster (jobmanager + one taskmanager): computes the
+  # gold layer from Debezium's change topics (flink/sql/gold.sql) and
+  # writes it to gold.* topics. Jobs are submitted by
+  # scripts/deploy_gold.sh, not at container start.
+  # ---------------------------------------------------------------------
+  flink-jobmanager:
+    container_name: dbz-flink-jobmanager
+    image: dbz-flink:local
+    build:
+      context: ./flink
+    restart: unless-stopped
+    command: jobmanager
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8088:8081" # Flink web UI + REST API
+    environment:
+      FLINK_PROPERTIES: &flink-properties |
+        jobmanager.rpc.address: dbz-flink-jobmanager
+        rest.address: dbz-flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        parallelism.default: 1
+        state.backend.type: hashmap
+        execution.checkpointing.interval: 10s
+        execution.checkpointing.dir: file:///opt/flink/checkpoints
+    volumes:
+      - ./flink/sql:/opt/flink/sql:ro
+      - flink_checkpoints:/opt/flink/checkpoints
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview >/dev/null"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+  flink-taskmanager:
+    container_name: dbz-flink-taskmanager
+    image: dbz-flink:local
+    build:
+      context: ./flink
+    restart: unless-stopped
+    command: taskmanager
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    environment:
+      FLINK_PROPERTIES: *flink-properties
+    volumes:
+      - flink_checkpoints:/opt/flink/checkpoints
+
 volumes:
   kafka_data:
   source_pgdata:
   clickhouse_data:
+  flink_checkpoints:
 
 networks:
   default:
