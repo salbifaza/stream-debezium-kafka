@@ -1,4 +1,4 @@
-.PHONY: help up down reset logs register gold verify status smoke
+.PHONY: help up down reset logs tables register gold verify status smoke
 
 help:
 	@echo "Usage:"
@@ -7,18 +7,19 @@ help:
 	@echo "  make reset           Stop, wipe all volumes, and rebuild from scratch"
 	@echo "  make logs            Tail all service logs"
 	@echo ""
+	@echo "  make tables          Generate ClickHouse tables + indexes from the Postgres schema (idempotent)"
 	@echo "  make register        Register source + sink connectors (idempotent)"
 	@echo "  make gold            Deploy the Flink gold layer: topics, ClickHouse tables, job (idempotent)"
 	@echo "  make verify          Row counts, live insert/update/delete, new column, gold vs. Postgres"
 	@echo "  make status          Connector status, consumer lag, WAL retention, row counts"
-	@echo "  make smoke           Full end-to-end smoke test (register + gold + verify)"
+	@echo "  make smoke           Full end-to-end smoke test (tables + register + gold + verify)"
 
 # ── infrastructure ────────────────────────────────────────────────────────────
 
 up:
 	cp -n .env.example .env 2>/dev/null || true
 	docker compose up -d --build
-	@echo "Waiting for Kafka Connect to become healthy..."
+	@./scripts/create_ch_tables.sh
 	@./scripts/register_connectors.sh
 	@./scripts/deploy_gold.sh
 	@echo ""
@@ -43,6 +44,9 @@ logs:
 
 # ── connectors ────────────────────────────────────────────────────────────────
 
+tables:
+	./scripts/create_ch_tables.sh
+
 register:
 	./scripts/register_connectors.sh
 
@@ -57,4 +61,4 @@ status:
 
 # ── testing ───────────────────────────────────────────────────────────────────
 
-smoke: register gold verify
+smoke: tables register gold verify

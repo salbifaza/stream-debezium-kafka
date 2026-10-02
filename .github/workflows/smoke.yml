@@ -18,6 +18,9 @@ jobs:
           cp .env.example .env
           docker compose up -d --build
 
+      - name: Create ClickHouse tables from the Postgres schema
+        run: ./scripts/create_ch_tables.sh
+
       - name: Register connectors
         run: ./scripts/register_connectors.sh
 

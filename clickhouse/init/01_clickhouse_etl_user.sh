@@ -6,7 +6,8 @@
 # should authenticate as it.
 #
 # Unlike PeerDB's ClickHouse peer, this connector never runs CREATE TABLE --
-# destination tables are pre-created by hand in 02_destination_tables.sql.
+# destination tables are generated from the Postgres catalog and created,
+# as the admin user, by scripts/create_ch_tables.sh.
 # It does run ALTER TABLE ... ADD COLUMN, because the sink runs with
 # `auto.evolve=true` (connectors/ch-sink-connector.json): a column added on
 # the source is added in ClickHouse automatically. Without this grant the
