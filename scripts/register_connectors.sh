@@ -60,6 +60,15 @@ register connectors/pg-source-connector.json
 register connectors/ch-sink-connector.json
 
 echo "== Connector status =="
+# A just-created connector's status 404s until Connect has written it.
 for name in ecommerce-pg-source ecommerce-ch-sink; do
-    curl -sf "${CONNECT_URL}/connectors/${name}/status" | jq .
+    deadline=$((SECONDS + 30))
+    until status=$(curl -sf "${CONNECT_URL}/connectors/${name}/status"); do
+        if [ $SECONDS -ge $deadline ]; then
+            echo "No status for ${name} within 30s." >&2
+            exit 1
+        fi
+        sleep 1
+    done
+    jq . <<<"$status"
 done

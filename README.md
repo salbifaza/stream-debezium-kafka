@@ -203,7 +203,7 @@ the change stream is worth more than any one destination.
 | **Fan-out** | Any number of consumers read the same replayable log | One more system to run (Kafka) |
 | **Decoupling** | Source, broker and sink are independently versioned and replaceable | Debugging spans Postgres, Kafka Connect and ClickHouse |
 | **Replay** | A new consumer can rebuild its state from the topics | Topic retention has to be sized for it |
-| **Schema** | Full control over destination DDL | DDL is hand-written; only `ADD COLUMN` is automatic |
+| **Schema** | Full control over destination DDL | The sink creates no tables; a script generates them, and later only `ADD COLUMN` is automatic |
 
 **The proof:** the Flink gold layer was added as a second consumer
 without touching the source connector or the ClickHouse sink. A search
@@ -262,8 +262,29 @@ which the sink authenticates as:
 GRANT INSERT, SELECT, ALTER ADD COLUMN ON debezium_cdc.* TO clickhouse_etl;
 ```
 
-The sink never creates tables. Destination DDL is hand-written in
-[`clickhouse/init/02_destination_tables.sql`](clickhouse/init/02_destination_tables.sql).
+The sink never creates tables.
+[`scripts/create_ch_tables.sh`](scripts/create_ch_tables.sh) (`make tables`,
+run by `make up` before the connectors are registered) generates them from
+the Postgres catalog for every table in the publication:
+
+- **Columns** are type-mapped from Postgres; `NOT NULL` decides `Nullable`.
+  A text column with an `IN (...)` `CHECK` becomes `LowCardinality(String)`.
+- **`ORDER BY`** is the Postgres primary key. It is also
+  `ReplacingMergeTree`'s dedup key.
+- **Every other Postgres index**, including the ones behind `UNIQUE`
+  constraints, becomes a ClickHouse data-skipping index with the same name:
+  `bloom_filter` for equality lookups on integer, string, UUID and date
+  columns, `minmax` for everything else. These skip granules; they enforce
+  nothing, so `UNIQUE` is not enforced.
+
+```sql
+ALTER TABLE debezium_cdc.orders ADD INDEX idx_orders_customer customer_id TYPE bloom_filter GRANULARITY 1;
+```
+
+Re-running it is safe. Existing tables are left alone (`auto.evolve` adds new
+columns), and an index added in Postgres later is added and built over
+existing rows. `./scripts/create_ch_tables.sh --print` shows the SQL without
+applying it.
 
 **Connectors** are checked-in JSON
 ([`connectors/`](connectors/)), applied idempotently by
@@ -303,11 +324,12 @@ flink/Dockerfile          # Flink 2.2 + Kafka SQL connector
 flink/sql/gold.sql        # Debezium topics -> aggregates -> gold.* topics
 
 postgres/init/            # replication access, schema + publication, seed data
-clickhouse/init/          # least-privilege user, silver DDL
+clickhouse/init/          # least-privilege user
 clickhouse/gold.sql       # gold tables + Kafka engine consumers
 
 connectors/               # source and sink connector configs
 scripts/
+  create_ch_tables.sh     # generate ClickHouse tables + skip indexes from Postgres
   register_connectors.sh  # apply connector configs via REST
   deploy_gold.sh          # gold topics, ClickHouse DDL, Flink job submit
   verify_cdc.sh           # end-to-end verification (also run in CI)
